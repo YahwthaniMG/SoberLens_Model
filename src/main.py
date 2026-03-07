@@ -34,7 +34,7 @@ OUTPUT_DRUNK = "../output/drunk"
 TEMP_VIDEO_DIR = "../temp_videos"
 
 # Configuración del detector de rostros
-DETECTOR_TYPE = "opencv"  # "opencv" (recomendado), "mediapipe" o "mtcnn"
+DETECTOR_TYPE = "mediapipe"
 FACE_OUTPUT_SIZE = 224  # Tamaño en pixeles de las imágenes de rostros
 MIN_CONFIDENCE = 0.7  # Confianza mínima (0.0 a 1.0)
 SAMPLE_INTERVAL = 0.5  # Segundos entre cada frame a analizar

@@ -1,14 +1,13 @@
 """
-Script para procesar imágenes de un dataset existente.
-Detecta rostros, los recorta y los guarda en tamaño estándar (224x224).
+Script para procesar un dataset de imagenes existentes.
+Detecta rostros, los alinea y guarda en tamano estandar (224x224).
 
-Modifica las variables en la sección CONFIGURACION y ejecuta:
+Uso:
     python process_existing_images.py
 """
 
 import os
 from pathlib import Path
-
 import cv2
 
 from face_extractor import FaceExtractor
@@ -18,160 +17,133 @@ from face_extractor import FaceExtractor
 # CONFIGURACION
 # =============================================================================
 
-# Carpetas de entrada con las imágenes originales del dataset
 INPUT_SOBER = "../data/dataset_images/sober"
 INPUT_DRUNK = "../data/dataset_images/drunk"
 
-# Carpetas de salida (las mismas que usa main.py)
-OUTPUT_SOBER = "../output/sober/example"
+OUTPUT_SOBER = "../output/sober"
 OUTPUT_DRUNK = "../output/drunk"
 
-# Configuración del detector
-DETECTOR_TYPE = "opencv"
+# Detector a usar: "mediapipe" (recomendado) u "opencv" (fallback)
+DETECTOR_TYPE = "mediapipe"
 FACE_OUTPUT_SIZE = 224
-MIN_CONFIDENCE = 0.7
+MIN_CONFIDENCE = 0.5
 
-# Extensiones de imagen a procesar
-IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".bmp", ".webp"]
+# Extensiones de imagen aceptadas
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 
 # =============================================================================
-# FIN DE CONFIGURACION
+# FIN CONFIGURACION
 # =============================================================================
-
-
-def process_image(
-    image_path: str,
-    output_dir: str,
-    extractor: FaceExtractor,
-    image_index: int,
-    prefix: str,
-) -> int:
-    """
-    Procesa una imagen: detecta rostros y los guarda.
-
-    Returns:
-        Número de rostros extraídos de la imagen
-    """
-    image = cv2.imread(image_path)
-
-    if image is None:
-        print(f"  No se pudo leer: {image_path}")
-        return 0
-
-    # Detectar rostros
-    faces = extractor.process_frame(image)
-
-    if not faces:
-        print(f"  Sin rostros: {Path(image_path).name}")
-        return 0
-
-    # Guardar cada rostro detectado
-    for face_idx, face in enumerate(faces):
-        filename = f"{prefix}_img{image_index:04d}_face{face_idx:02d}.jpg"
-        output_path = Path(output_dir) / filename
-        cv2.imwrite(str(output_path), face, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
-    return len(faces)
 
 
 def process_folder(
-    input_dir: str, output_dir: str, extractor: FaceExtractor, prefix: str
+    input_dir: str,
+    output_dir: str,
+    extractor: FaceExtractor,
+    prefix: str,
 ) -> dict:
-    """
-    Procesa todas las imágenes de una carpeta.
-    """
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    stats = {"images_processed": 0, "images_skipped": 0, "faces_extracted": 0}
+    stats = {
+        "images_read": 0,
+        "images_with_face": 0,
+        "images_skipped": 0,
+        "faces_saved": 0,
+    }
 
     if not input_dir.exists():
         print(f"Carpeta no encontrada: {input_dir}")
         return stats
 
-    # Obtener lista de imágenes
-    image_files = []
-    for ext in IMAGE_EXTENSIONS:
-        image_files.extend(input_dir.glob(f"*{ext}"))
-        image_files.extend(input_dir.glob(f"*{ext.upper()}"))
-
-    image_files = sorted(set(image_files))
+    image_files = sorted(
+        [
+            p
+            for p in input_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+    )
 
     if not image_files:
-        print(f"No se encontraron imágenes en: {input_dir}")
+        print(f"Sin imagenes en: {input_dir}")
         return stats
 
-    print(f"Procesando {len(image_files)} imágenes de: {input_dir}")
+    print(f"Procesando {len(image_files)} imagenes desde: {input_dir}")
 
-    for idx, image_path in enumerate(image_files):
-        faces_count = process_image(
-            str(image_path), str(output_dir), extractor, idx, prefix
-        )
+    for idx, img_path in enumerate(image_files):
+        stats["images_read"] += 1
 
-        if faces_count > 0:
-            stats["images_processed"] += 1
-            stats["faces_extracted"] += faces_count
-        else:
+        faces = extractor.process_image(str(img_path))
+
+        if not faces:
             stats["images_skipped"] += 1
+            if (idx + 1) % 20 == 0:
+                print(f"  [{idx + 1}/{len(image_files)}] sin rostros: {img_path.name}")
+            continue
 
-        # Mostrar progreso cada 50 imágenes
+        stats["images_with_face"] += 1
+
+        for face_idx, face in enumerate(faces):
+            filename = f"{prefix}_{idx:05d}_f{face_idx:02d}.jpg"
+            out_path = output_dir / filename
+            cv2.imwrite(str(out_path), face, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            stats["faces_saved"] += 1
+
         if (idx + 1) % 50 == 0:
-            print(f"  Progreso: {idx + 1}/{len(image_files)}")
+            print(
+                f"  [{idx + 1}/{len(image_files)}] rostros guardados hasta ahora: {stats['faces_saved']}"
+            )
 
     return stats
 
 
 def main():
     print("=" * 60)
-    print("PROCESAMIENTO DE DATASET DE IMAGENES")
+    print("PROCESAMIENTO DE DATASET DE IMAGENES EXISTENTES")
     print("=" * 60)
 
-    # Inicializar extractor
     print(f"\nInicializando detector: {DETECTOR_TYPE}")
     extractor = FaceExtractor(
         detector_type=DETECTOR_TYPE,
-        output_size=(FACE_OUTPUT_SIZE, FACE_OUTPUT_SIZE),
+        output_size=FACE_OUTPUT_SIZE,
         min_confidence=MIN_CONFIDENCE,
-        min_face_size=FACE_OUTPUT_SIZE // 2,
+        padding=0.3,
+        quality_check=True,
+        min_sharpness=60.0,
     )
 
-    # Procesar imágenes de personas sobrias
-    print("\n" + "=" * 60)
-    print("PROCESANDO IMAGENES - SOBRIOS")
-    print("=" * 60)
-    sober_stats = process_folder(
-        INPUT_SOBER, OUTPUT_SOBER, extractor, prefix="dataset_sober"
-    )
+    print("\n" + "-" * 60)
+    print("SOBRIOS")
+    print("-" * 60)
+    sober_stats = process_folder(INPUT_SOBER, OUTPUT_SOBER, extractor, "sober")
 
-    # Procesar imágenes de personas ebrias
-    print("\n" + "=" * 60)
-    print("PROCESANDO IMAGENES - EBRIOS")
-    print("=" * 60)
-    drunk_stats = process_folder(
-        INPUT_DRUNK, OUTPUT_DRUNK, extractor, prefix="dataset_drunk"
-    )
+    print("\n" + "-" * 60)
+    print("EBRIOS")
+    print("-" * 60)
+    drunk_stats = process_folder(INPUT_DRUNK, OUTPUT_DRUNK, extractor, "drunk")
 
-    # Resumen
     print("\n" + "=" * 60)
     print("RESUMEN")
     print("=" * 60)
 
     print("\nSOBRIOS:")
-    print(f"  Imágenes procesadas: {sober_stats['images_processed']}")
-    print(f"  Imágenes sin rostro: {sober_stats['images_skipped']}")
-    print(f"  Rostros extraídos: {sober_stats['faces_extracted']}")
+    print(f"  Imagenes leidas:       {sober_stats['images_read']}")
+    print(f"  Con rostro detectado:  {sober_stats['images_with_face']}")
+    print(f"  Sin rostro / descarte: {sober_stats['images_skipped']}")
+    print(f"  Rostros guardados:     {sober_stats['faces_saved']}")
 
     print("\nEBRIOS:")
-    print(f"  Imágenes procesadas: {drunk_stats['images_processed']}")
-    print(f"  Imágenes sin rostro: {drunk_stats['images_skipped']}")
-    print(f"  Rostros extraídos: {drunk_stats['faces_extracted']}")
+    print(f"  Imagenes leidas:       {drunk_stats['images_read']}")
+    print(f"  Con rostro detectado:  {drunk_stats['images_with_face']}")
+    print(f"  Sin rostro / descarte: {drunk_stats['images_skipped']}")
+    print(f"  Rostros guardados:     {drunk_stats['faces_saved']}")
 
-    total = sober_stats["faces_extracted"] + drunk_stats["faces_extracted"]
-    print(f"\nTOTAL ROSTROS EXTRAIDOS: {total}")
-    print(f"\nGuardados en:")
+    total = sober_stats["faces_saved"] + drunk_stats["faces_saved"]
+    print(f"\nTOTAL ROSTROS GUARDADOS: {total}")
+    print(f"\nSalida:")
     print(f"  Sobrios: {os.path.abspath(OUTPUT_SOBER)}")
-    print(f"  Ebrios: {os.path.abspath(OUTPUT_DRUNK)}")
+    print(f"  Ebrios:  {os.path.abspath(OUTPUT_DRUNK)}")
 
 
 if __name__ == "__main__":

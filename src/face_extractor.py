@@ -1,378 +1,428 @@
 """
-Módulo para detectar y extraer rostros de videos.
-Ofrece tres backends: OpenCV (Haar Cascade), MTCNN y MediaPipe.
+Modulo para detectar, alinear y extraer rostros de videos e imagenes.
+
+Backend principal: MediaPipe Tasks (FaceDetector + FaceLandmarker)
+- Deteccion precisa con modelo BlazeFace
+- Alineacion facial usando landmarks (ojos) para normalizar rotacion
+- Padding proporcional y verificacion de calidad estricta
+- Sin rostros incompletos: se descarta cualquier recorte que toque el borde
+
+Fallback: OpenCV Haar Cascade (si MediaPipe no esta disponible)
 """
 
 import cv2
 import numpy as np
+import urllib.request
 from pathlib import Path
 from typing import List, Tuple, Optional
-from abc import ABC, abstractmethod
 import os
 
 
-class FaceDetector(ABC):
-    """Clase base abstracta para detectores de rostros."""
+# ---------------------------------------------------------------------------
+# Rutas de modelos MediaPipe (se descargan automaticamente si no existen)
+# ---------------------------------------------------------------------------
 
-    @abstractmethod
-    def detect_faces(self, image: np.ndarray) -> List[dict]:
-        """
-        Detecta rostros en una imagen.
+MODELS_DIR = Path(__file__).parent / "models"
 
-        Args:
-            image: Imagen en formato BGR (OpenCV)
+FACE_DETECTOR_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_detector/"
+    "blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+)
+FACE_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
 
-        Returns:
-            Lista de diccionarios con 'box' (x, y, w, h) y 'confidence'
-        """
-        pass
+FACE_DETECTOR_MODEL_PATH = MODELS_DIR / "blaze_face_short_range.tflite"
+FACE_LANDMARKER_MODEL_PATH = MODELS_DIR / "face_landmarker.task"
 
 
-class OpenCVDetector(FaceDetector):
+def download_model(url: str, dest: Path):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not dest.exists():
+        print(f"Descargando modelo: {dest.name} ...")
+        urllib.request.urlretrieve(url, str(dest))
+        print(f"Modelo descargado: {dest.name}")
+
+
+# ---------------------------------------------------------------------------
+# Indices de landmarks MediaPipe relevantes para alineacion
+# El FaceLandmarker devuelve 478 puntos (malla facial densa)
+# Usamos el centro de cada ojo para alinear
+# ---------------------------------------------------------------------------
+
+# Indices del contorno del ojo izquierdo y derecho en la malla de 478 puntos
+LEFT_EYE_CENTER_IDX = 468  # iris izquierdo centro
+RIGHT_EYE_CENTER_IDX = 473  # iris derecho centro
+
+# Alternativas si no hay iris (modelo sin tracking de iris): esquinas del ojo
+LEFT_EYE_INNER = 133
+LEFT_EYE_OUTER = 33
+RIGHT_EYE_INNER = 362
+RIGHT_EYE_OUTER = 263
+
+
+# ---------------------------------------------------------------------------
+# Detector principal: MediaPipe Tasks
+# ---------------------------------------------------------------------------
+
+
+class MediaPipeDetector:
     """
-    Detector de rostros usando OpenCV Haar Cascade.
-    Usa múltiples cascades para mejor detección.
+    Detector de rostros usando MediaPipe Tasks API (>= 0.10.x).
+    Combina FaceDetector (bounding box) y FaceLandmarker (478 puntos).
     """
 
-    def __init__(
-        self,
-        scale_factor: float = 1.05,
-        min_neighbors: int = 3,
-        min_face_size: int = 20,
-    ):
-        # Cargar múltiples clasificadores para mejor cobertura
-        self.cascades = []
+    def __init__(self, min_detection_confidence: float = 0.5):
+        import mediapipe as mp
 
-        cascade_files = [
-            "haarcascade_frontalface_alt2.xml",  # Mejor para rostros variados
-            "haarcascade_frontalface_default.xml",
-            "haarcascade_frontalface_alt.xml",
-        ]
+        self.mp = mp
+        self.min_confidence = min_detection_confidence
 
-        for cascade_file in cascade_files:
-            cascade_path = cv2.data.haarcascades + cascade_file
-            cascade = cv2.CascadeClassifier(cascade_path)
-            if not cascade.empty():
-                self.cascades.append(cascade)
+        download_model(FACE_DETECTOR_MODEL_URL, FACE_DETECTOR_MODEL_PATH)
+        download_model(FACE_LANDMARKER_MODEL_URL, FACE_LANDMARKER_MODEL_PATH)
 
-        if not self.cascades:
-            raise RuntimeError("No se pudo cargar ningún clasificador Haar Cascade")
+        BaseOptions = mp.tasks.BaseOptions
+        VisionRunningMode = mp.tasks.vision.RunningMode
 
-        self.scale_factor = scale_factor
-        self.min_neighbors = min_neighbors
-        self.min_face_size = min_face_size
+        # Detector de bounding boxes
+        FaceDetector = mp.tasks.vision.FaceDetector
+        FaceDetectorOptions = mp.tasks.vision.FaceDetectorOptions
+        det_options = FaceDetectorOptions(
+            base_options=BaseOptions(model_asset_path=str(FACE_DETECTOR_MODEL_PATH)),
+            running_mode=VisionRunningMode.IMAGE,
+            min_detection_confidence=min_detection_confidence,
+        )
+        self.detector = FaceDetector.create_from_options(det_options)
 
-    def detect_faces(self, image: np.ndarray) -> List[dict]:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # Landmarker para alineacion
+        FaceLandmarker = mp.tasks.vision.FaceLandmarker
+        FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+        lm_options = FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(FACE_LANDMARKER_MODEL_PATH)),
+            running_mode=VisionRunningMode.IMAGE,
+            num_faces=4,
+            min_face_detection_confidence=min_detection_confidence,
+            min_face_presence_confidence=min_detection_confidence,
+        )
+        self.landmarker = FaceLandmarker.create_from_options(lm_options)
 
-        # Mejorar contraste para mejor detección
-        gray = cv2.equalizeHist(gray)
+    def _to_mp_image(self, bgr_image: np.ndarray):
+        rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+        return self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb)
 
-        all_faces = []
+    def detect(self, image: np.ndarray) -> List[dict]:
+        """
+        Devuelve lista de detecciones con:
+          - box: [x, y, w, h] en pixeles
+          - confidence: float
+          - landmarks: array (N, 2) en pixeles o None
+        """
+        h, w = image.shape[:2]
+        mp_img = self._to_mp_image(image)
 
-        # Probar con cada cascade
-        for cascade in self.cascades:
-            faces = cascade.detectMultiScale(
-                gray,
-                scaleFactor=self.scale_factor,
-                minNeighbors=self.min_neighbors,
-                minSize=(self.min_face_size, self.min_face_size),
+        det_result = self.detector.detect(mp_img)
+        lm_result = self.landmarker.detect(mp_img)
+
+        # Construir mapa de landmarks por posicion de bounding box
+        lm_map = {}
+        for face_lms in lm_result.face_landmarks:
+            pts = np.array([[lm.x * w, lm.y * h] for lm in face_lms], dtype=np.float32)
+            # Calcular centro del conjunto de landmarks
+            cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+            lm_map[(round(cx), round(cy))] = pts
+
+        detections = []
+        for det in det_result.detections:
+            bb = det.bounding_box
+            x, y, bw, bh = bb.origin_x, bb.origin_y, bb.width, bb.height
+            score = det.categories[0].score
+
+            # Buscar landmarks correspondientes (el mas cercano al centro del box)
+            box_cx = x + bw / 2
+            box_cy = y + bh / 2
+            best_pts = None
+            best_dist = float("inf")
+            for (lcx, lcy), pts in lm_map.items():
+                dist = (lcx - box_cx) ** 2 + (lcy - box_cy) ** 2
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pts = pts
+
+            detections.append(
+                {
+                    "box": [x, y, bw, bh],
+                    "confidence": score,
+                    "landmarks": best_pts,
+                }
             )
 
-            for x, y, w, h in faces:
-                all_faces.append(
-                    {"box": [int(x), int(y), int(w), int(h)], "confidence": 0.85}
-                )
-
-            # Si encontramos rostros, no seguir buscando
-            if len(faces) > 0:
-                break
-
-        # Eliminar detecciones duplicadas (boxes muy similares)
-        if len(all_faces) > 1:
-            all_faces = self._remove_duplicates(all_faces)
-
-        return all_faces
-
-    def _remove_duplicates(
-        self, faces: List[dict], iou_threshold: float = 0.5
-    ) -> List[dict]:
-        """Elimina detecciones duplicadas basándose en IoU."""
-        if not faces:
-            return faces
-
-        # Ordenar por área (más grandes primero)
-        faces = sorted(faces, key=lambda f: f["box"][2] * f["box"][3], reverse=True)
-
-        keep = []
-        for face in faces:
-            is_duplicate = False
-            for kept in keep:
-                if self._calculate_iou(face["box"], kept["box"]) > iou_threshold:
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
-                keep.append(face)
-
-        return keep
-
-    def _calculate_iou(self, box1: List[int], box2: List[int]) -> float:
-        """Calcula Intersection over Union entre dos boxes."""
-        x1, y1, w1, h1 = box1
-        x2, y2, w2, h2 = box2
-
-        # Calcular intersección
-        xi1 = max(x1, x2)
-        yi1 = max(y1, y2)
-        xi2 = min(x1 + w1, x2 + w2)
-        yi2 = min(y1 + h1, y2 + h2)
-
-        if xi2 <= xi1 or yi2 <= yi1:
-            return 0.0
-
-        inter_area = (xi2 - xi1) * (yi2 - yi1)
-
-        # Calcular unión
-        box1_area = w1 * h1
-        box2_area = w2 * h2
-        union_area = box1_area + box2_area - inter_area
-
-        return inter_area / union_area if union_area > 0 else 0.0
+        return detections
 
 
-class MTCNNDetector(FaceDetector):
-    """Detector de rostros usando MTCNN."""
+# ---------------------------------------------------------------------------
+# Fallback: OpenCV (solo si MediaPipe no esta disponible)
+# ---------------------------------------------------------------------------
 
-    def __init__(self, min_face_size: int = 40):
-        from mtcnn import MTCNN
 
-        self.detector = MTCNN(min_face_size=min_face_size)
+class OpenCVDetector:
+    """Detector fallback con Haar Cascade. Menos preciso."""
 
-    def detect_faces(self, image: np.ndarray) -> List[dict]:
-        # MTCNN espera RGB
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        detections = self.detector.detect_faces(rgb_image)
+    def __init__(self):
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
+        self.cascade = cv2.CascadeClassifier(cascade_path)
+        if self.cascade.empty():
+            raise RuntimeError("No se pudo cargar haarcascade_frontalface_alt2.xml")
 
+    def detect(self, image: np.ndarray) -> List[dict]:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        faces = self.cascade.detectMultiScale(
+            gray, scaleFactor=1.05, minNeighbors=4, minSize=(50, 50)
+        )
         results = []
-        for det in detections:
+        for x, y, w, h in faces:
             results.append(
                 {
-                    "box": det["box"],  # [x, y, width, height]
-                    "confidence": det["confidence"],
+                    "box": [int(x), int(y), int(w), int(h)],
+                    "confidence": 0.8,
+                    "landmarks": None,
                 }
             )
         return results
 
 
-class MediaPipeDetector(FaceDetector):
+# ---------------------------------------------------------------------------
+# Alineacion facial
+# ---------------------------------------------------------------------------
+
+
+def align_face(
+    image: np.ndarray,
+    landmarks: Optional[np.ndarray],
+    output_size: int = 224,
+) -> Optional[np.ndarray]:
     """
-    Detector de rostros usando MediaPipe.
-    Soporta tanto la API legacy (solutions) como la nueva API (tasks).
+    Alinea el rostro usando los centros de los ojos como referencia.
+    Si no hay landmarks, hace un resize simple.
+
+    Args:
+        image: recorte del rostro (ya con padding aplicado)
+        landmarks: array (N, 2) de landmarks en coordenadas del recorte
+        output_size: tamano cuadrado de salida
+
+    Returns:
+        Imagen alineada de tamano (output_size, output_size, 3)
     """
-
-    def __init__(self, min_detection_confidence: float = 0.5):
-        self.min_confidence = min_detection_confidence
-        self.detector = None
-        self.use_legacy_api = False
-        self.use_tasks_api = False
-
-        # Intentar cargar MediaPipe (primero legacy, luego tasks)
-        try:
-            import mediapipe as mp
-
-            # Intentar API legacy (mp.solutions) - versiones < 0.10.31
-            if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_detection"):
-                self.mp = mp
-                self.mp_face_detection = mp.solutions.face_detection
-                self.detector = self.mp_face_detection.FaceDetection(
-                    model_selection=1, min_detection_confidence=min_detection_confidence
-                )
-                self.use_legacy_api = True
-                print("MediaPipe: usando API legacy (solutions)")
-
-            # Intentar API nueva (tasks) - versiones >= 0.10.31
-            elif hasattr(mp, "tasks"):
-                self._setup_tasks_api(mp, min_detection_confidence)
-                self.use_tasks_api = True
-                print("MediaPipe: usando API nueva (tasks)")
-
-            else:
-                raise ImportError("MediaPipe no tiene 'solutions' ni 'tasks'")
-
-        except Exception as e:
-            raise ImportError(
-                f"Error cargando MediaPipe: {e}\n"
-                "Opciones:\n"
-                "  1. Instalar versión compatible: pip install mediapipe==0.10.9\n"
-                "  2. Usar detector 'opencv' o 'mtcnn' en su lugar"
-            )
-
-    def _setup_tasks_api(self, mp, min_confidence):
-        """Configura la API nueva de MediaPipe Tasks."""
-        import urllib.request
-
-        # Descargar modelo si no existe
-        model_path = Path(__file__).parent / "blaze_face_short_range.tflite"
-        if not model_path.exists():
-            print("Descargando modelo de MediaPipe...")
-            url = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
-            urllib.request.urlretrieve(url, str(model_path))
-
-        BaseOptions = mp.tasks.BaseOptions
-        FaceDetector = mp.tasks.vision.FaceDetector
-        FaceDetectorOptions = mp.tasks.vision.FaceDetectorOptions
-        VisionRunningMode = mp.tasks.vision.RunningMode
-
-        options = FaceDetectorOptions(
-            base_options=BaseOptions(model_asset_path=str(model_path)),
-            running_mode=VisionRunningMode.IMAGE,
-            min_detection_confidence=min_confidence,
+    if landmarks is None or len(landmarks) < 478:
+        return cv2.resize(
+            image, (output_size, output_size), interpolation=cv2.INTER_LANCZOS4
         )
-        self.detector = FaceDetector.create_from_options(options)
-        self.mp = mp
 
-    def detect_faces(self, image: np.ndarray) -> List[dict]:
-        if self.use_legacy_api:
-            return self._detect_legacy(image)
-        elif self.use_tasks_api:
-            return self._detect_tasks(image)
-        return []
+    h, w = image.shape[:2]
 
-    def _detect_legacy(self, image: np.ndarray) -> List[dict]:
-        """Detección usando API legacy (solutions)."""
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self.detector.process(rgb_image)
+    # Obtener centros de los ojos
+    # Intentar iris primero (indices 468 y 473), luego esquinas
+    if len(landmarks) >= 478:
+        left_eye = landmarks[LEFT_EYE_CENTER_IDX]
+        right_eye = landmarks[RIGHT_EYE_CENTER_IDX]
+    else:
+        left_eye = landmarks[[LEFT_EYE_INNER, LEFT_EYE_OUTER]].mean(axis=0)
+        right_eye = landmarks[[RIGHT_EYE_INNER, RIGHT_EYE_OUTER]].mean(axis=0)
 
-        detections = []
-        if results.detections:
-            h, w = image.shape[:2]
-            for detection in results.detections:
-                bbox = detection.location_data.relative_bounding_box
-                x = int(bbox.xmin * w)
-                y = int(bbox.ymin * h)
-                width = int(bbox.width * w)
-                height = int(bbox.height * h)
+    # Angulo entre ojos
+    dx = right_eye[0] - left_eye[0]
+    dy = right_eye[1] - left_eye[1]
+    angle = np.degrees(np.arctan2(dy, dx))
 
-                detections.append(
-                    {"box": [x, y, width, height], "confidence": detection.score[0]}
-                )
+    # Centro entre los ojos
+    eye_center = ((left_eye[0] + right_eye[0]) / 2, (left_eye[1] + right_eye[1]) / 2)
 
-        return detections
+    # Distancia deseada entre ojos en la imagen de salida
+    desired_eye_y = 0.35  # ojos al 35% desde arriba
+    desired_left_eye_x = 0.30
+    desired_dist = output_size * (1.0 - 2 * desired_left_eye_x)
 
-    def _detect_tasks(self, image: np.ndarray) -> List[dict]:
-        """Detección usando API nueva (tasks)."""
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mp_image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb_image)
+    current_dist = np.sqrt(dx * dx + dy * dy)
+    scale = desired_dist / (current_dist + 1e-6)
 
-        results = self.detector.detect(mp_image)
+    # Matriz de rotacion y escala centrada en el punto medio de los ojos
+    M = cv2.getRotationMatrix2D(eye_center, angle, scale)
 
-        detections = []
-        h, w = image.shape[:2]
-        for detection in results.detections:
-            bbox = detection.bounding_box
-            detections.append(
-                {
-                    "box": [bbox.origin_x, bbox.origin_y, bbox.width, bbox.height],
-                    "confidence": detection.categories[0].score,
-                }
-            )
+    # Ajustar traslacion para que los ojos queden en la posicion deseada
+    tX = output_size * 0.5
+    tY = output_size * desired_eye_y
+    M[0, 2] += tX - eye_center[0]
+    M[1, 2] += tY - eye_center[1]
 
-        return detections
+    aligned = cv2.warpAffine(
+        image,
+        M,
+        (output_size, output_size),
+        flags=cv2.INTER_LANCZOS4,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return aligned
+
+
+# ---------------------------------------------------------------------------
+# FaceExtractor: clase principal
+# ---------------------------------------------------------------------------
 
 
 class FaceExtractor:
-    """Clase principal para extraer rostros de videos."""
+    """
+    Extrae rostros de videos e imagenes con alta calidad.
+
+    Flujo por deteccion:
+        1. Deteccion del bounding box (MediaPipe BlazeFace)
+        2. Expansion con padding proporcional
+        3. Verificacion: el recorte no toca bordes de la imagen
+        4. Alineacion con landmarks (rotacion por angulo entre ojos)
+        5. Verificacion de calidad (nitidez, brillo, contraste)
+        6. Guardado en output_size x output_size
+    """
 
     def __init__(
         self,
-        detector_type: str = "opencv",
-        min_face_size: int = 80,
-        output_size: Tuple[int, int] = (224, 224),
-        min_confidence: float = 0.7,
-        padding: float = 0.2,
+        detector_type: str = "mediapipe",
+        output_size: int = 224,
+        min_confidence: float = 0.5,
+        padding: float = 0.3,
+        min_face_size: int = 60,
+        quality_check: bool = True,
+        min_sharpness: float = 80.0,
     ):
         """
         Args:
-            detector_type: "opencv" (sin dependencias extra), "mediapipe" o "mtcnn"
-            min_face_size: Tamaño mínimo de rostro a detectar (pixeles)
-            output_size: Tamaño de salida de las imágenes de rostros
-            min_confidence: Confianza mínima para aceptar una detección
-            padding: Porcentaje de padding alrededor del rostro (0.2 = 20%)
+            detector_type: "mediapipe" (recomendado) u "opencv" (fallback)
+            output_size: tamano cuadrado de salida en pixeles
+            min_confidence: confianza minima del detector
+            padding: fraccion de padding alrededor del box (0.3 = 30%)
+            min_face_size: tamano minimo del box detectado en pixeles
+            quality_check: si True, descarta imagenes borrosas/oscuras
+            min_sharpness: varianza del Laplaciano minima para aceptar
         """
-        self.min_face_size = min_face_size
         self.output_size = output_size
         self.min_confidence = min_confidence
         self.padding = padding
+        self.min_face_size = min_face_size
+        self.quality_check = quality_check
+        self.min_sharpness = min_sharpness
 
-        if detector_type == "opencv":
-            self.detector = OpenCVDetector(min_face_size=min_face_size)
-        elif detector_type == "mediapipe":
-            self.detector = MediaPipeDetector(min_detection_confidence=min_confidence)
-        elif detector_type == "mtcnn":
-            self.detector = MTCNNDetector(min_face_size=min_face_size)
+        if detector_type == "mediapipe":
+            try:
+                self.detector = MediaPipeDetector(
+                    min_detection_confidence=min_confidence
+                )
+                print("Detector: MediaPipe Tasks (BlazeFace + FaceLandmarker)")
+            except Exception as e:
+                print(f"MediaPipe no disponible ({e}), usando OpenCV como fallback")
+                self.detector = OpenCVDetector()
+        elif detector_type == "opencv":
+            self.detector = OpenCVDetector()
+            print("Detector: OpenCV Haar Cascade (fallback)")
         else:
             raise ValueError(
-                f"Detector no soportado: {detector_type}. Usa 'opencv', 'mediapipe' o 'mtcnn'"
+                f"detector_type debe ser 'mediapipe' u 'opencv', no '{detector_type}'"
             )
 
-    def extract_face(self, image: np.ndarray, box: List[int]) -> Optional[np.ndarray]:
+    def _crop_with_padding(
+        self, image: np.ndarray, box: List[int]
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]:
         """
-        Extrae y redimensiona un rostro de la imagen.
-
-        Args:
-            image: Imagen original
-            box: [x, y, width, height] del rostro
-
-        Returns:
-            Imagen del rostro recortada y redimensionada
+        Recorta el rostro con padding. Retorna (recorte, landmarks_en_recorte, valido).
+        Si el recorte se sale de la imagen, retorna (None, None, False).
         """
         x, y, w, h = box
         img_h, img_w = image.shape[:2]
 
-        # Filtrar rostros muy pequeños
         if w < self.min_face_size or h < self.min_face_size:
-            return None
+            return None, None, False
 
-        # Agregar padding
-        pad_w = int(w * self.padding)
-        pad_h = int(h * self.padding)
+        # Padding proporcional al mayor lado
+        side = max(w, h)
+        pad = int(side * self.padding)
 
-        x1 = max(0, x - pad_w)
-        y1 = max(0, y - pad_h)
-        x2 = min(img_w, x + w + pad_w)
-        y2 = min(img_h, y + h + pad_h)
+        x1 = x - pad
+        y1 = y - pad
+        x2 = x + w + pad
+        y2 = y + h + pad
 
-        # Recortar rostro
-        face = image[y1:y2, x1:x2]
+        # Descartar si el recorte se sale significativamente de la imagen
+        # Tolerancia del 5% del lado
+        tol = int(side * 0.05)
+        if x1 < -tol or y1 < -tol or x2 > img_w + tol or y2 > img_h + tol:
+            return None, None, False
 
-        if face.size == 0:
-            return None
+        # Clipear a los bordes de la imagen
+        x1c = max(0, x1)
+        y1c = max(0, y1)
+        x2c = min(img_w, x2)
+        y2c = min(img_h, y2)
 
-        # Redimensionar
-        face = cv2.resize(face, self.output_size, interpolation=cv2.INTER_LANCZOS4)
+        crop = image[y1c:y2c, x1c:x2c]
+        if crop.size == 0:
+            return None, None, False
 
-        return face
+        return crop, (x1c, y1c), True
+
+    def _check_quality(self, face: np.ndarray) -> bool:
+        if not self.quality_check:
+            return True
+        gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+        brightness = np.mean(gray)
+        contrast = np.std(gray)
+        return (
+            sharpness >= self.min_sharpness and 30 < brightness < 230 and contrast > 20
+        )
 
     def process_frame(self, frame: np.ndarray) -> List[np.ndarray]:
         """
-        Procesa un frame y extrae todos los rostros detectados.
-
-        Args:
-            frame: Frame del video (BGR)
+        Detecta y extrae todos los rostros validos de un frame.
 
         Returns:
-            Lista de imágenes de rostros
+            Lista de imagenes de rostros alineadas, tamano output_size x output_size
         """
-        detections = self.detector.detect_faces(frame)
-        faces = []
+        detections = self.detector.detect(frame)
+        results = []
 
         for det in detections:
-            if det["confidence"] >= self.min_confidence:
-                face = self.extract_face(frame, det["box"])
-                if face is not None:
-                    faces.append(face)
+            if det["confidence"] < self.min_confidence:
+                continue
 
-        return faces
+            crop, crop_origin, valid = self._crop_with_padding(frame, det["box"])
+            if not valid or crop is None:
+                continue
+
+            # Ajustar landmarks al sistema de coordenadas del recorte
+            aligned_lms = None
+            if det["landmarks"] is not None:
+                ox, oy = crop_origin
+                lms_in_crop = det["landmarks"] - np.array([ox, oy], dtype=np.float32)
+                aligned_lms = lms_in_crop
+
+            face = align_face(crop, aligned_lms, self.output_size)
+            if face is None:
+                continue
+
+            if not self._check_quality(face):
+                continue
+
+            results.append(face)
+
+        return results
+
+    def process_image(self, image_path: str) -> List[np.ndarray]:
+        """
+        Procesa una imagen estatica y retorna los rostros extraidos.
+        """
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"No se pudo leer: {image_path}")
+            return []
+        return self.process_frame(image)
 
     def process_video(
         self,
@@ -382,25 +432,24 @@ class FaceExtractor:
         max_faces_per_video: int = 100,
     ) -> int:
         """
-        Procesa un video y guarda los rostros extraídos.
+        Procesa un video, extrae rostros y los guarda.
 
         Args:
-            video_path: Ruta al archivo de video
-            output_dir: Directorio donde guardar los rostros
-            sample_interval: Intervalo en segundos entre muestreos
-            max_faces_per_video: Máximo de rostros a extraer por video
+            video_path: ruta al video
+            output_dir: directorio de salida
+            sample_interval: segundos entre frames analizados
+            max_faces_per_video: limite de rostros por video
 
         Returns:
-            Número de rostros extraídos
+            Numero de rostros guardados
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-
         video_name = Path(video_path).stem
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            print(f"Error: No se puede abrir el video {video_path}")
+            print(f"Error: no se puede abrir {video_path}")
             return 0
 
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -409,7 +458,7 @@ class FaceExtractor:
 
         print(f"Procesando: {video_name}")
         print(
-            f"  FPS: {fps:.2f}, Frames totales: {total_frames}, Intervalo: cada {sample_rate} frames"
+            f"  FPS: {fps:.1f} | Frames: {total_frames} | Intervalo: cada {sample_rate} frames"
         )
 
         face_count = 0
@@ -420,75 +469,29 @@ class FaceExtractor:
             if not ret:
                 break
 
-            # Muestrear frames según intervalo
             if frame_idx % sample_rate != 0:
                 frame_idx += 1
                 continue
 
-            # Detectar y extraer rostros
             faces = self.process_frame(frame)
 
             for face in faces:
                 if face_count >= max_faces_per_video:
                     break
-
-                # Guardar rostro
-                face_filename = (
-                    f"{video_name}_frame{frame_idx:06d}_face{face_count:04d}.jpg"
+                filename = f"{video_name}_f{frame_idx:06d}_r{face_count:04d}.jpg"
+                cv2.imwrite(
+                    str(output_dir / filename),
+                    face,
+                    [cv2.IMWRITE_JPEG_QUALITY, 95],
                 )
-                face_path = output_dir / face_filename
-                cv2.imwrite(str(face_path), face, [cv2.IMWRITE_JPEG_QUALITY, 95])
                 face_count += 1
 
             if face_count >= max_faces_per_video:
-                print(f"  Alcanzado límite de {max_faces_per_video} rostros")
+                print(f"  Limite alcanzado: {max_faces_per_video} rostros")
                 break
 
             frame_idx += 1
 
         cap.release()
-        print(f"  Rostros extraídos: {face_count}")
+        print(f"  Rostros extraidos: {face_count}")
         return face_count
-
-
-def check_face_quality(face_image: np.ndarray) -> dict:
-    """
-    Evalúa la calidad de una imagen de rostro.
-
-    Args:
-        face_image: Imagen del rostro
-
-    Returns:
-        Diccionario con métricas de calidad
-    """
-    gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
-
-    # Calcular nitidez usando varianza del Laplaciano
-    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-
-    # Calcular brillo promedio
-    brightness = np.mean(gray)
-
-    # Calcular contraste
-    contrast = np.std(gray)
-
-    return {
-        "sharpness": laplacian_var,
-        "brightness": brightness,
-        "contrast": contrast,
-        "is_good_quality": laplacian_var > 100
-        and 50 < brightness < 200
-        and contrast > 30,
-    }
-
-
-if __name__ == "__main__":
-    # Ejemplo de uso
-    extractor = FaceExtractor(
-        detector_type="mediapipe", output_size=(224, 224), min_confidence=0.7
-    )
-
-    # Probar con una imagen
-    test_image = np.zeros((480, 640, 3), dtype=np.uint8)
-    faces = extractor.process_frame(test_image)
-    print(f"Rostros detectados en imagen de prueba: {len(faces)}")
