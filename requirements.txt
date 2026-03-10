@@ -1,4 +1,4 @@
-# Dependencias para el proyecto de detección de ebriedad
+# Dependencias para el proyecto SoberLens
 # Instalar con: pip install -r requirements.txt
 
 # Descarga de videos de YouTube
@@ -8,12 +8,8 @@ yt-dlp
 opencv-python>=4.8.0
 numpy>=1.24.0
 
-# Detección de rostros
-# Opción 1: MTCNN (más preciso, un poco más lento)
-mtcnn>=0.1.1
-tensorflow>=2.13.0
-
-# Opción 2: MediaPipe (más rápido, buena precisión) - Recomendado para Windows
+# Deteccion de rostros (backend principal)
+# MediaPipe 0.10.x usa la API de tasks (FaceDetector + FaceLandmarker)
 mediapipe>=0.10.9
 
 # Utilidades

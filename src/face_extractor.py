@@ -66,7 +66,7 @@ MAX_EYE_DISTANCE_RATIO = 0.80
 # 0.0 = cara perfectamente centrada, 1.0 = perfil total.
 # 0.35 permite hasta ~35% de rotacion lateral (three-quarter view aceptable).
 # Bajar a 0.25 para exigir caras mas frontales y estrictas.
-MAX_FACE_YAW_ASYMMETRY = 0.25
+MAX_FACE_YAW_ASYMMETRY = 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ class MediaPipeDetector:
     Combina FaceDetector (bounding box) y FaceLandmarker (478 puntos).
     """
 
-    def __init__(self, min_detection_confidence: float = 0.5):
+    def __init__(self, min_detection_confidence: float = 0.85):
         import mediapipe as mp
 
         self.mp = mp
