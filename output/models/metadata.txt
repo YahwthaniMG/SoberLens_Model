@@ -1,0 +1,4 @@
+Clasificador: SVM RBF
+Accuracy en test: 93.65%
+Features: 327
+Clases: 0=sober, 1=drunk
