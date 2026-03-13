@@ -2,7 +2,7 @@
 
 Pipeline de datos y entrenamiento del modelo de detección de intoxicación por análisis facial. Este repositorio contiene todo el flujo para construir el clasificador binario (sobrio / ebrio) que alimenta la aplicación móvil SoberLens.
 
-> El repositorio de la aplicación PWA se encuentra en [SoberLens_App](https://github.com/tu-org/soberlens-app) *(próximamente)*.
+> El repositorio de la aplicación PWA se encuentra en [SoberLens_App](https://github.com/YahwthaniMG/SoberLens_App) *(próximamente)*.
 
 ---
 
